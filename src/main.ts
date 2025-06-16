@@ -1,10 +1,10 @@
-import { openNewDevice, NetMDInterface, Disc, DevicesIds } from 'netmd-js';
+import { openNewDevice, NetMDInterface, Disc, DevicesIds, getTracks, Encoding } from 'netmd-js';
 import { Mutex } from 'async-mutex';
-import { mount, MountOptions, ENOENT, EACCES, EPERM, ENOTEMPTY } from 'fuse-bindings';
+import { mount, MountOptions, ENOENT, EACCES, EPERM, ENOTEMPTY } from 'node-fuse-bindings';
 import { FSDirectory, FSFile, Cache } from './filesystem';
 import { synchronized, getValidNameTracks } from './utils';
 import { concatUint8Arrays } from 'netmd-js/dist/utils';
-import { ToC } from 'netmd-tocmanip';
+import { readFileSync, statSync } from 'fs';
 import { TransferManager } from './transfer';
 import { WebUSB } from 'usb';
 import { createTFSStructure, parseTFSStructure } from './tfs';
@@ -35,6 +35,16 @@ interface FileHandle {
 }
 
 async function init(){
+    const args = process.argv.slice(2);
+    let argIndex = -1;
+    const mountpoint = args[args.length - 1];
+    if(args.includes("--help") || !mountpoint || !statSync(mountpoint)?.isDirectory()) {
+        console.log(`${process.argv[1]} [OPTIONS] /path/to/mount`);
+        console.log("Options available:");
+        console.log("\t--format - format the drive as brand new")
+        console.log("\t--fs /path/to/tfs.bin - use the alternative TFS.bin file");
+        return;
+    }
     const usb = new WebUSB({deviceTimeout: 100000, allowedDevices: DevicesIds});
     const dev = await openNewDevice(usb);
     if(!dev){
@@ -46,7 +56,13 @@ async function init(){
     await tra.init(cah);
     await cah.init();
     await cah.refreshCache();
-    await prepareMount(tra, cah);
+    if(args.includes("--format")) {
+        cah.filesystem = new FSDirectory("");
+    }
+    if((argIndex = args.indexOf("--fs")) != -1) {
+        cah.filesystem = parseTFSStructure(new Uint8Array(readFileSync(args[argIndex + 1])), tra);
+    }
+    await prepareMount(tra, cah, mountpoint);
 }
 
 function getStat(stat: any){
@@ -74,16 +90,33 @@ function fsFileToReadHandle(file: FSFile){
     return handle;
 }
 
-async function prepareMount(transferManager: TransferManager, cache: Cache){
+async function prepareMount(transferManager: TransferManager, cache: Cache, root: string){
     const systemFiles: {[key: string]: SystemFile} = {
-        "info": {
-            available: [ AvailableFunction.READ ],
-            read: async () => {
-                return new TextEncoder().encode(`
-Please don't treat this software seriously...
-(c) Copyright ${new Date().getFullYear()}, Asivery
-                `);
-            }
+        "fsinfo": {
+            available: [AvailableFunction.READ],
+            read: async () => await synchronized(fileMutex, () => {
+                let output = 'Track list:\n';
+                let allTracks = getTracks(cache.disc!);
+                for(let i = 0; i<cache.disc!.trackCount; i++) {
+                    const type = allTracks[i].title?.startsWith("h_fs_") ? "FILE" : "AUDIO";
+                    output += `    ${i}. ${allTracks[i].title} [${Encoding[allTracks[i].encoding]}] - ${type}\n`;
+                }
+                output += "\n\nFiles:\n"
+                function processDirectory(root: FSDirectory, pre: string) {
+                    output += pre + (root.name || '<root>') + ": \n";
+                    let newPre = '    ' + pre;
+                    for(let file of Object.values(root.files)) {
+                        if(file instanceof FSDirectory) {
+                            processDirectory(file, newPre);
+                        } else {
+                            output += `${newPre}${file.name}: ${file.byteLength} bytes, ID: ${file.trackID}, resolved track number: ${cache.resolveIDToIndex(file.trackID)}\n`;
+                        }
+                    }
+                }
+                processDirectory(cache.filesystem, '    ');
+                output += `Next file ID: ${cache.nextFileID}\n`
+                return new TextEncoder().encode(output);
+            }),
         },
         "handles": {
             available: [ AvailableFunction.READ ],
@@ -129,12 +162,12 @@ Please don't treat this software seriously...
         readdir: (path: string, cb: (code: number, list: string[]) => void) => {
             console.log('readdir(%s)', path)
             if(path === '/'){
-                cb(0, ['$audio', '$system', ...Object.keys(cache.filesystem.files)]);
+                cb(0, ['.audio', '.system', ...Object.keys(cache.filesystem.files)]);
                 return;
-            }else if(path === "/$system"){
+            }else if(path === "/.system"){
                 cb(0, Object.keys(systemFiles));
                 return;
-            }else if(path === "/$audio"){
+            }else if(path === "/.audio"){
                 cb(0, getValidNameTracks(cache.disc!).map(n => n.name));
                 return;
             }
@@ -169,14 +202,14 @@ Please don't treat this software seriously...
         },
         getattr: async (path: string, cb: (code: number, stats?: any) => void) => {
             console.log('getattr(%s)', path)
-            if(['/', '/$audio', '/$system'].includes(path)){
+            if(['/', '/.audio', '/.system'].includes(path)){
                 cb(0, getStat({
                     mode: S_IFDIR | RW_ACCESS,
                     size: 1,
                 }));
                 return;
             }
-            if(path.startsWith("/$system/")){
+            if(path.startsWith("/.system/")){
                 let fileName = getFileName(path);
                 let file = systemFiles[fileName];
                 let accessMode = EXEC_ACCESS;
@@ -191,7 +224,7 @@ Please don't treat this software seriously...
                 }
                 return;
             }
-            if(path.startsWith("/$audio/")){
+            if(path.startsWith("/.audio/")){
                 let fileName = getFileName(path);
                 let allTracks = getValidNameTracks(cache.disc!);
                 let thisTrack = allTracks.find(e => e.name === fileName);
@@ -233,7 +266,7 @@ Please don't treat this software seriously...
             if(flags !== 0 && flags !== 1){
                 cb(EACCES, 0); // Only normal read and normal write.
             }
-            if(path.startsWith("/$system/")){
+            if(path.startsWith("/.system/")){
                 let fileName = getFileName(path);
                 let file = systemFiles[fileName];
                 if(!file){
@@ -275,7 +308,7 @@ Please don't treat this software seriously...
                 }
                 return;
             }
-            if(path.startsWith("/$audio/")){
+            if(path.startsWith("/.audio/")){
                 let fileName = getFileName(path);
                 let allTracks = getValidNameTracks(cache.disc!);
                 let thisTrack = allTracks.find(e => e.name === fileName);
@@ -343,7 +376,7 @@ Please don't treat this software seriously...
                         });
                         if(cachedFile.contents!.length !== 0){
                             await transferManager.startFileWriteTransfer(idToUse, cachedFile.contents!);
-                            await cache.flushCache();
+                            await cache.changed();
                         }
                     },
                     write: async (offset: number, length: number, data: Uint8Array) => {
@@ -368,11 +401,11 @@ Please don't treat this software seriously...
         },
         create: async (path: string, mode: number, cb: (code: number, fd: number) => void) => {
             console.log('create(%s, %d)', path, mode)
-            if(path.startsWith("/$system/")){
+            if(path.startsWith("/.system/")){
                 cb(EPERM, 0);
                 return;
             }
-            if(path.startsWith("/$audio/")){
+            if(path.startsWith("/.audio/")){
                 cb(EPERM, 0);
             }
             let idToUse = cache.nextFileID;
@@ -391,7 +424,7 @@ Please don't treat this software seriously...
                     });
                     if(cachedFile.contents!.length !== 0){
                         await transferManager.startFileWriteTransfer(idToUse, cachedFile.contents!);
-                        await cache.flushCache();
+                        await cache.changed();
                     }
                 },
                 write: async (offset: number, length: number, data: Uint8Array) => {
@@ -458,11 +491,11 @@ Please don't treat this software seriously...
         },
         unlink: async (path: string, cb: (code: number) => void) => {
             console.log('release(%s)', path);
-            if(path.startsWith("/$system")){
+            if(path.startsWith("/.system")){
                 cb(EPERM);
                 return;
             }
-            if(path.startsWith("/$audio/")){
+            if(path.startsWith("/.audio/")){
                 const fileName = getFileName(path);
                 const allTracks = getValidNameTracks(cache.disc!);
                 let thisTrack = allTracks.find(e => e.name === fileName);
@@ -536,12 +569,20 @@ Please don't treat this software seriously...
             destParent.add(file);
             cb(0);
         },
+        destroy: async (cb) => {
+            console.log("Closing the FS");
+            if(cache.dirty) {
+                await cache.flushCache();
+            }
+            cb(0);
+            process.exit(0);
+        },
         options: ['async_read']
     };
 
-    mount("./mnt", callbacks, (e: any) => {
+    mount(root, callbacks, (e: any) => {
         if(e) console.log(e);
-        else console.log("Mounted!")
+        else console.log("Mounted! Please unmount with the `umount' command instead of exiting with CTRL+C!");
     });
 }
 

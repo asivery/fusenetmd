@@ -11,6 +11,7 @@ export class Cache {
     audioFileCache: FSFile[] = [];
     filesystem: FSDirectory = new FSDirectory("");
     nextFileID: number = 0;
+    dirty: boolean = false;
 
     constructor(private transferManager: TransferManager){}
 
@@ -47,8 +48,11 @@ export class Cache {
     }
 
     async flushCache(){
+        console.log("====Flushing FS Caches====");
         await this.transferManager.writeTOC(this.filesystem);
         await this.refreshCache();
+        console.log("======Flushed Caches======");
+        this.dirty = false;
     }
 
     resolveIDToIndex(id: number) {
@@ -57,6 +61,11 @@ export class Cache {
         let matching = tracks.find(n => n.title === `h_fs_${id.toString(16).padStart(2, '0')}`);
         if(!matching) return -1;
         return matching.index;
+    }
+
+    async changed() {
+        this.dirty = true;
+        await this.refreshCache();
     }
 }
 

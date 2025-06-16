@@ -4,7 +4,7 @@ import { Worker } from 'worker_threads';
 import { synchronized, asyncMutex } from "./utils";
 import { NetMDInterface, DiscFormat, listContent, writeUTOCSector, NetMDFactoryInterface, readUTOCSector, MDTrack, Wireformat, download } from "netmd-js";
 import { makeGetAsyncPacketIteratorOnWorkerThread } from 'netmd-js/dist/node-encrypt-worker';
-import { ExploitStateManager, CachedSectorAtracDownload, ForceTOCEdit, AtracRecovery } from 'netmd-exploits';
+import { ExploitStateManager, AtracRecovery, ForceTOCEdit, getBestSuited, AtracRecoveryConfig } from 'netmd-exploits';
 import { ToC, reconstructTOC, getTitleByTrackNumber, ModeFlag, parseTOC } from 'netmd-tocmanip';
 import { createTFSStructure, parseTFSStructure } from "./tfs";
 import path from 'path';
@@ -36,15 +36,15 @@ export class TransferManager {
 
     @asyncMutex
     async startReadTransfer(target: FSFile, trackID: number, opts?: ReadTransferParams){
-        const recovery = await this.exploitManager?.require(CachedSectorAtracDownload);
+        const recovery = await this.exploitManager?.require(getBestSuited(AtracRecovery, this.exploitManager.device)!);
         let trackIndex;
-        let options = {} as any;
+        let options = {} as AtracRecoveryConfig;
 
         if(opts?.audioTrack){
             trackIndex = trackID;
         }else{
             trackIndex = this.cache!.resolveIDToIndex(trackID);
-            options.forceRemoveLPBytes = true;
+            options.removeLPBytes = 'always';
             options.writeHeader = false;
         }
         console.log(`Reading ${trackIndex}`);
@@ -53,7 +53,9 @@ export class TransferManager {
             data => console.log(JSON.stringify(data)),
             options
         )){
-            await target.append(chunk);
+            if(chunk.type == 'audioData' || (opts?.audioTrack && chunk.type == 'header')) {
+                await target.append(chunk.chunk!);
+            }
         }
         await target.markAsComplete();
 
@@ -93,6 +95,7 @@ export class TransferManager {
         }catch(er){
             console.log(er);
             root = new FSDirectory("");
+            console.log("Treating as an unformatted system and formatting as TFS!");
         }
         return root;
     }
