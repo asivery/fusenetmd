@@ -145,6 +145,28 @@ Please don't treat this software seriously...
             }
             cb(0, []);
         },
+        statfs(path, cb) {
+            console.log('statfs(%s)', path);
+            const allSeconds = cache.disc!.total / 512;
+            const leftSeconds = cache.disc!.left / 512;
+            const allBytes = Math.floor(((allSeconds * 1000) / 11.6) * 212);
+            const leftBytes = Math.floor(((leftSeconds * 1000) / 11.6) * 212);
+            const BS = 4096;
+
+            cb(0, {
+                fsid: 0,
+                bsize: BS,
+                blocks: Math.floor(allBytes / BS),
+                bfree: Math.floor(leftBytes / BS),
+                bavail: Math.floor(leftBytes / BS),
+                flag: 16, /*ST_SYNCHRONOUS*/
+                namemax: 128,
+                files: cache.disc!.trackCount,
+                ffree: 255 - cache.disc!.trackCount,
+                frsize: BS,
+                favail: 255 - cache.disc!.trackCount,
+            });
+        },
         getattr: async (path: string, cb: (code: number, stats?: any) => void) => {
             console.log('getattr(%s)', path)
             if(['/', '/$audio', '/$system'].includes(path)){
